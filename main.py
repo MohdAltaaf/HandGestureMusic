@@ -39,7 +39,6 @@ def finger_states(lm):
 # ---------- Signs ----------
 FIST = (0, 0, 0, 0, 0)
 
-# 12 hand patterns, in order
 PATTERNS = [
     (0, 1, 0, 0, 0),   # 1  index
     (0, 1, 1, 0, 0),   # 2  index+middle
@@ -75,52 +74,112 @@ QUALITIES = [
     ("7sus4", [0, 5, 7, 10]),
 ]
 
-NOTE_SIGNS = dict(zip(PATTERNS[:7], ROOTS[:7]))   # note mode: just C..B
-ROOT_SIGNS = dict(zip(PATTERNS, ROOTS))           # chord mode right hand
-QUALITY_SIGNS = dict(zip(PATTERNS, QUALITIES))    # chord mode left hand
+NOTE_SIGNS = dict(zip(PATTERNS[:7], ROOTS[:7]))     # notes mode: C..B
+ROOT_SIGNS = dict(zip(PATTERNS, ROOTS))             # chords mode, right hand
+QUALITY_SIGNS = dict(zip(PATTERNS, QUALITIES))      # chords mode, left hand
+DEGREE_SIGNS = dict(zip(PATTERNS[:7], range(7)))    # key mode: sign -> scale degree
 
-# ---------- Interface ----------
+# ---------- Music theory ----------
 CHROMATIC = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 QUALITY_NAMES = [q[0] for q in QUALITIES]
+NOTE_NAMES = ["C", "D", "E", "F", "G", "A", "B"]
+SCALES = {
+    "major": [0, 2, 4, 5, 7, 9, 11],
+    "minor": [0, 2, 3, 5, 7, 8, 10],     # natural minor
+}
+
+MODES = ["notes", "chords", "key"]
+mode = "notes"
+OCTAVE_BASES = {1: 48, 2: 60, 3: 72, 4: 84}
+note_base = 60       # notes/key mode octave (left hand)
+chord_base = 48      # chords mode octave (W / S keys)
+key_root = 0         # 0 = C
+scale_name = "major"
+
+
+def diatonic_notes(degree, base=0):
+    """Stack thirds on the scale: scale note, skip one, next, skip one, next."""
+    scale = SCALES[scale_name]
+    chord = []
+    for step in (0, 2, 4):
+        idx = degree + step
+        chord.append(base + key_root + scale[idx % 7] + 12 * (idx // 7))
+    return tuple(chord)
+
+
+def chord_name(degree):
+    n = diatonic_notes(degree)
+    third, fifth = n[1] - n[0], n[2] - n[0]
+    suffix = {(4, 7): "", (3, 7): "m", (3, 6): "dim"}.get((third, fifth), "?")
+    return CHROMATIC[n[0] % 12] + suffix
+
+
+# ---------- Interface ----------
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 AMBER = (0, 184, 255)    # BGR
 GREY = (80, 80, 80)
+WHITE = (255, 255, 255)
+LM_STYLE = draw.DrawingSpec(color=AMBER, thickness=2, circle_radius=2)
+CONN_STYLE = draw.DrawingSpec(color=WHITE, thickness=1)
 
 
-def draw_bar(frame, names, active, y, bar_h=28):
-    cell = frame.shape[1] // len(names)
+def draw_tabs(frame):
+    for i, m in enumerate(MODES):
+        x0 = 8 + i * 114
+        on = (m == mode)
+        cv2.rectangle(frame, (x0, 8), (x0 + 110, 32), AMBER if on else GREY, -1)
+        cv2.putText(frame, f"{i + 1} {m.upper()}", (x0 + 10, 26), FONT, 0.5,
+                    (0, 0, 0) if on else WHITE, 1)
+
+
+def draw_bar(frame, names, active, y, bar_h=26):
+    margin = 8
+    cell = (frame.shape[1] - 2 * margin) // len(names)
+    scale = 0.5 if len(names) <= 7 else 0.4
     for i, name in enumerate(names):
-        x0 = i * cell
+        x0 = margin + i * cell
         on = (name == active)
-        cv2.rectangle(frame, (x0, y), (x0 + cell - 2, y + bar_h),
+        cv2.rectangle(frame, (x0, y), (x0 + cell - 3, y + bar_h),
                       AMBER if on else GREY, -1)
-        cv2.putText(frame, name, (x0 + 4, y + bar_h - 9),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    (0, 0, 0) if on else (255, 255, 255), 1)
+        (tw, th), _ = cv2.getTextSize(name, FONT, scale, 1)
+        cv2.putText(frame, name, (x0 + (cell - 3 - tw) // 2, y + (bar_h + th) // 2),
+                    FONT, scale, (0, 0, 0) if on else WHITE, 1)
+
+
+def label_box(frame, text, x, y):
+    h, w, _ = frame.shape
+    (tw, th), _ = cv2.getTextSize(text, FONT, 0.6, 2)
+    x = max(4, min(x, w - tw - 8))
+    y = max(th + 8, min(y, h - 4))
+    cv2.rectangle(frame, (x - 4, y - th - 6), (x + tw + 4, y + 4), (30, 30, 30), -1)
+    cv2.putText(frame, text, (x, y), FONT, 0.6, WHITE, 2)
 
 
 def hand_text(label, states):
     if label == "Right":
         if states == FIST:
             return "rest"
-        table = NOTE_SIGNS if mode == "notes" else ROOT_SIGNS
-        return table.get(states, ("?",))[0]
-    if mode == "notes":
-        return f"Octave {sum(states)}"
-    if states == FIST:
-        return "Major"
-    return QUALITY_SIGNS.get(states, ("?",))[0]
+        if mode == "notes":
+            return NOTE_SIGNS.get(states, ("?",))[0]
+        if mode == "chords":
+            return ROOT_SIGNS.get(states, ("?",))[0]
+        return chord_name(DEGREE_SIGNS[states]) if states in DEGREE_SIGNS else "?"
+    if mode == "chords":
+        return "Major" if states == FIST else QUALITY_SIGNS.get(states, ("?",))[0]
+    return f"Octave {sum(states)}" if sum(states) in OCTAVE_BASES else "(keep)"
 
 
-# ---------- State ----------
-mode = "notes"                       # "notes" or "chords"
-OCTAVE_BASES = {1: 48, 2: 60, 3: 72, 4: 84}
-note_base = 60                       # note mode octave (left hand)
-chord_base = 48                      # chord mode octave (W / S keys)
+HINTS = {
+    "notes":  "M or 1-2-3: mode | left hand: octave | Esc: quit",
+    "chords": "M or 1-2-3: mode | W/S: octave | Esc: quit",
+    "key":    "M or 1-2-3: mode | J/K: key | T: major/minor | Esc: quit",
+}
 
-sounding = ()                        # MIDI notes currently on
+# ---------- Sound state ----------
+sounding = ()        # MIDI notes currently on
 candidate = ()
 stable_count = 0
-STABLE_FRAMES = 2
+STABLE_FRAMES = 0
 
 # ---------- Main loop ----------
 while True:
@@ -131,7 +190,12 @@ while True:
     result = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     h, w, _ = frame.shape
 
-    right = None    # finger pattern of right hand, None if not seen
+    # darken the panels behind the text (after detection, so it can't hurt tracking)
+    top_h = 106 if mode == "chords" else 74
+    frame[0:top_h] = cv2.convertScaleAbs(frame[0:top_h], alpha=0.4)
+    frame[h - 58:h] = cv2.convertScaleAbs(frame[h - 58:h], alpha=0.4)
+
+    right = None    # finger pattern of the right hand, None if not seen
     left = None
 
     if result.multi_hand_landmarks:
@@ -143,26 +207,33 @@ while True:
             else:
                 left = states
 
-            draw.draw_landmarks(frame, lm, mp.solutions.hands.HAND_CONNECTIONS)
-            x = int(lm.landmark[0].x * w)
-            y = int(lm.landmark[0].y * h)
-            cv2.putText(frame, f"{label}: {hand_text(label, states)}",
-                        (x - 40, y + 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            draw.draw_landmarks(frame, lm, mp.solutions.hands.HAND_CONNECTIONS,
+                                landmark_drawing_spec=LM_STYLE,
+                                connection_drawing_spec=CONN_STYLE)
+            x = int(lm.landmark[0].x * w) - 30
+            y = int(lm.landmark[0].y * h) + 35
+            label_box(frame, f"{label}: {hand_text(label, states)}", x, y)
 
     # --- decide which notes we WANT right now ---
     # desired = tuple of MIDI notes, () for silence, None to hold (unknown sign)
     desired = None
-    active_root = None
-    active_quality = None
+    active = None       # highlighted cell in the first bar
+    active2 = None      # highlighted cell in the second bar (chords mode)
+    now_text = ""
+
+    if mode in ("notes", "key") and left is not None and sum(left) in OCTAVE_BASES:
+        note_base = OCTAVE_BASES[sum(left)]
 
     if mode == "notes":
-        if left is not None and sum(left) in OCTAVE_BASES:
-            note_base = OCTAVE_BASES[sum(left)]
         if right is None or right == FIST:
             desired = ()
         elif right in NOTE_SIGNS:
-            desired = (note_base + NOTE_SIGNS[right][1],)
-    else:
+            name, offset = NOTE_SIGNS[right]
+            desired = (note_base + offset,)
+            active = now_text = name
+        cur_base = note_base
+
+    elif mode == "chords":
         if right is None or right == FIST:
             desired = ()
         elif right in ROOT_SIGNS:
@@ -174,9 +245,20 @@ while True:
                 root_name, root_offset = ROOT_SIGNS[right]
                 root_midi = chord_base + root_offset
                 desired = tuple(root_midi + i for i in quality[1])
-                active_root, active_quality = root_name, quality[0]
+                active, active2 = root_name, quality[0]
+                now_text = f"{root_name} {quality[0]}"
+        cur_base = chord_base
 
-    # --- stability filter ---
+    else:  # key mode
+        if right is None or right == FIST:
+            desired = ()
+        elif right in DEGREE_SIGNS:
+            degree = DEGREE_SIGNS[right]
+            desired = diatonic_notes(degree, note_base - 12)
+            active = now_text = chord_name(degree)
+        cur_base = note_base - 12
+
+    # --- stability filter + note on/off ---
     if desired is not None:
         if desired == candidate:
             stable_count += 1
@@ -184,7 +266,6 @@ while True:
             candidate = desired
             stable_count = 1
 
-        # --- note on/off ---
         if stable_count >= STABLE_FRAMES and candidate != sounding:
             for n in candidate:
                 if n not in sounding:
@@ -195,21 +276,42 @@ while True:
             sounding = candidate
 
     # --- interface ---
-    if mode == "chords":
-        draw_bar(frame, CHROMATIC, active_root, 10)
-        draw_bar(frame, QUALITY_NAMES, active_quality, 44)
-    cv2.putText(frame, f"MODE: {mode.upper()}   (M = switch, W/S = chord octave)",
-                (10, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
+    draw_tabs(frame)
+    if mode == "notes":
+        draw_bar(frame, NOTE_NAMES, active, 40)
+    elif mode == "chords":
+        draw_bar(frame, CHROMATIC, active, 40)
+        draw_bar(frame, QUALITY_NAMES, active2, 72)
+    else:
+        draw_bar(frame, [chord_name(d) for d in range(7)], active, 40)
+        cv2.putText(frame, f"Key: {CHROMATIC[key_root]} {scale_name}", (360, 26),
+                    FONT, 0.6, AMBER, 2)
+
+    if now_text:
+        cv2.putText(frame, now_text, (14, h - 24), FONT, 1.0, AMBER, 2)
+    else:
+        cv2.putText(frame, "-", (14, h - 24), FONT, 1.0, GREY, 2)
+    cv2.putText(frame, f"Octave {cur_base // 12 - 1}", (w - 130, h - 24),
+                FONT, 0.6, WHITE, 1)
+    cv2.putText(frame, HINTS[mode], (14, h - 8), FONT, 0.42, (200, 200, 200), 1)
 
     cv2.imshow("hands", frame)
-    key = cv2.waitKey(1) & 0xFF
-    if key == 27:                       # Esc
+    pressed = cv2.waitKey(1) & 0xFF
+    if pressed == 27:                           # Esc
         break
-    elif key == ord('m'):
-        mode = "chords" if mode == "notes" else "notes"
-    elif key == ord('w'):
+    elif pressed == ord('m'):
+        mode = MODES[(MODES.index(mode) + 1) % 3]
+    elif pressed in (ord('1'), ord('2'), ord('3')):
+        mode = MODES[pressed - ord('1')]
+    elif pressed == ord('k'):
+        key_root = (key_root + 1) % 12
+    elif pressed == ord('j'):
+        key_root = (key_root - 1) % 12
+    elif pressed == ord('t'):
+        scale_name = "minor" if scale_name == "major" else "major"
+    elif pressed == ord('w'):
         chord_base = min(chord_base + 12, 72)
-    elif key == ord('s'):
+    elif pressed == ord('s'):
         chord_base = max(chord_base - 12, 36)
 
 # ---------- Cleanup ----------
