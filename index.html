@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Gesture Synth</title>
+<style>
+:root{--bg:#15171c;--panel:#22252d;--cell:#3a3e48;--amber:#ffb800;--text:#eceef2}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:16px/1.4 "Segoe UI",Trebuchet MS,sans-serif;display:flex;flex-direction:column;align-items:center;gap:12px;padding:20px 14px}
+h1{margin:0;font-size:1.6rem;font-weight:700;letter-spacing:.01em}
+.sub{margin:0;opacity:.7;text-align:center;max-width:56ch}
+#app{display:none;flex-direction:column;gap:10px;width:100%;max-width:760px}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+button,select{background:var(--cell);color:var(--text);border:0;border-radius:6px;padding:8px 14px;font:inherit;cursor:pointer}
+button:focus-visible,select:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+.tab.on{background:var(--amber);color:#111;font-weight:600}
+label{display:flex;gap:6px;align-items:center;opacity:.9}
+.bar{display:grid;gap:3px}
+.bar div{background:var(--cell);text-align:center;padding:7px 0;border-radius:4px;font-size:.85rem}
+.bar div.on{background:var(--amber);color:#111;font-weight:700}
+#stage{position:relative;aspect-ratio:4/3;background:#000;border-radius:10px;overflow:hidden}
+canvas{width:100%;height:100%;display:block}
+#now{position:absolute;left:14px;bottom:10px;font-size:2.2rem;font-weight:700;color:var(--amber);text-shadow:0 0 8px #000}
+#oct{position:absolute;right:14px;bottom:16px;text-shadow:0 0 8px #000}
+#start{background:var(--amber);color:#111;font-weight:700;font-size:1.1rem;padding:12px 26px}
+#msg{min-height:1.4em;opacity:.85}
+#hint{margin:0;opacity:.65;font-size:.85rem}
+details{background:var(--panel);border-radius:8px;padding:10px 14px}
+summary{cursor:pointer}
+table{border-collapse:collapse;margin-top:8px;width:100%;font-size:.9rem}
+td,th{text-align:left;padding:4px 10px 4px 0;border-bottom:1px solid var(--cell)}
+</style>
+</head>
+<body>
+<h1>Hand Gesture Synth</h1>
+<p class="sub">Play notes and chords with finger signs in front of your webcam. Video stays on your device.</p>
+<button id="start">Start camera and sound</button>
+<div id="msg"></div>
+<div id="app">
+  <div class="row" id="tabs"></div>
+  <div class="row">
+    <span class="row" id="keyCtl">
+      <label>Key <select id="keySel"></select></label>
+      <label>Scale <select id="scaleSel"><option>major</option><option>minor</option></select></label>
+    </span>
+    <label>Sound <select id="instSel"></select></label>
+    <button id="octDn">Octave down</button><button id="octUp">Octave up</button>
+  </div>
+  <div class="bar" id="bar1"></div>
+  <div class="bar" id="bar2"></div>
+  <div id="stage"><canvas id="cv" width="640" height="480"></canvas><div id="now"></div><div id="oct"></div></div>
+  <p id="hint"></p>
+  <details><summary>Hand signs</summary><table id="signs"></table></details>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const $ = id => document.getElementById(id);
+const CDN = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// ---------- Signs and music data (same tables as the Python version) ----------
+const PATTERNS = ["01000","01100","01110","01111","11111","10000","11000","11100","11110","00001","10001","01001"];
+const SIGN_NAMES = ["Index","Index + middle","Three fingers","Four fingers","Open hand","Thumb only","Thumb + index","Thumb + index + middle","Thumb + three fingers","Pinky only","Thumb + pinky","Index + pinky"];
+const FIST = "00000";
+const ROOTS = [["C",0],["D",2],["E",4],["F",5],["G",7],["A",9],["B",11],["C#",1],["D#",3],["F#",6],["G#",8],["A#",10]];
+const QUALS = [["Major",[0,4,7]],["Minor",[0,3,7]],["7",[0,4,7,10]],["5",[0,7,12]],["dim",[0,3,6]],["dim7",[0,3,6,9]],["aug",[0,4,8]],["sus2",[0,2,7]],["sus4",[0,5,7]],["maj7",[0,4,7,11]],["m7",[0,3,7,10]],["7sus4",[0,5,7,10]]];
+const SCALES = { major:[0,2,4,5,7,9,11], minor:[0,2,3,5,7,8,10] };
+const CHROM = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const OCT = {1:48, 2:60, 3:72, 4:84};
+const MODES = ["notes","chords","key"];
+const HINTS = {
+  notes:"Right hand: note. Left hand: octave (1 to 4 fingers). Fist or no right hand: silence.",
+  chords:"Right hand: root. Left hand: chord type (hidden or fist: Major). Octave: buttons or W / S.",
+  key:"Right hand: chord in the chosen key (7 signs). Left hand: octave. Keys: J / K key, T major or minor."
+};
+
+const idx = s => PATTERNS.indexOf(s);
+const count = s => [...s].reduce((a, c) => a + +c, 0);
+const same = (a, b) => a.join() === b.join();
+
+let mode = "notes", noteBase = 60, chordBase = 48, keyRoot = 0, scale = "major", swap = true;
+
+function diatonic(degree, base) {            // stack thirds on the scale
+  const sc = SCALES[scale];
+  return [0, 2, 4].map(step => { const i = degree + step; return base + keyRoot + sc[i % 7] + 12 * Math.floor(i / 7); });
+}
+function chordName(degree) {
+  const n = diatonic(degree, 0), t = n[1] - n[0], f = n[2] - n[0];
+  const suffix = t === 4 && f === 7 ? "" : t === 3 && f === 7 ? "m" : t === 3 && f === 6 ? "dim" : "?";
+  return CHROM[n[0] % 12] + suffix;
+}
+function fingers(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  const s = [d(4, 17) > d(3, 17)];
+  [[8,6],[12,10],[16,14],[20,18]].forEach(([t, k]) => s.push(lm[t].y < lm[k].y));
+  return s.map(Number).join("");
+}
+
+// ---------- Sound (Web Audio) ----------
+const INST = {
+  Pad:   { cut:1500, osc:[["sawtooth",-7,1,.35],["sawtooth",7,1,.35]] },
+  Organ: { cut:6000, osc:[["sine",0,1,.5],["sine",0,2,.25],["sine",0,.5,.25]] },
+  Soft:  { cut:3500, osc:[["triangle",0,1,.6]] }
+};
+let inst = "Pad", ac, filt;
+const voices = new Map();
+
+function noteOn(m) {
+  if (!ac || voices.has(m)) return;
+  const f = 440 * 2 ** ((m - 69) / 12), t = ac.currentTime, g = ac.createGain();
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(1, t + .03);
+  const oscs = INST[inst].osc.map(([type, det, mul, vol]) => {
+    const o = ac.createOscillator(), og = ac.createGain();
+    o.type = type; o.frequency.value = f * mul; o.detune.value = det; og.gain.value = vol;
+    o.connect(og).connect(g); o.start(); return o;
+  });
+  g.connect(filt); voices.set(m, { g, oscs });
+}
+function noteOff(m) {
+  const v = voices.get(m); if (!v) return; voices.delete(m);
+  const t = ac.currentTime;
+  v.g.gain.cancelScheduledValues(t); v.g.gain.setValueAtTime(v.g.gain.value, t); v.g.gain.linearRampToValueAtTime(0, t + .25);
+  v.oscs.forEach(o => o.stop(t + .3));
+}
+
+// ---------- Interface ----------
+function setMode(m) {
+  mode = m;
+  [...$("tabs").children].forEach((b, i) => b.classList.toggle("on", MODES[i] === m));
+  $("keyCtl").style.display = m === "key" ? "flex" : "none";
+  $("hint").textContent = HINTS[m];
+  const n1 = m === "notes" ? ROOTS.slice(0, 7).map(r => r[0]) : m === "chords" ? CHROM : [0,1,2,3,4,5,6].map(chordName);
+  fill($("bar1"), n1);
+  fill($("bar2"), m === "chords" ? QUALS.map(q => q[0]) : []);
+  last = "";
+}
+function fill(bar, names) {
+  bar.style.gridTemplateColumns = `repeat(${names.length || 1},1fr)`;
+  bar.innerHTML = names.map(n => `<div>${n}</div>`).join("");
+}
+function light(bar, name) { [...bar.children].forEach(c => c.classList.toggle("on", c.textContent === name)); }
+function shiftOctave(d) {
+  if (mode === "chords") chordBase = Math.max(36, Math.min(72, chordBase + 12 * d));
+  else noteBase = Math.max(48, Math.min(84, noteBase + 12 * d));
+}
+function handText(label, s) {
+  const i = idx(s), n = count(s);
+  if (label === "Right") {
+    if (s === FIST) return "rest";
+    if (i < 0) return "?";
+    if (mode === "chords") return ROOTS[i][0];
+    return i < 7 ? (mode === "notes" ? ROOTS[i][0] : chordName(i)) : "?";
+  }
+  if (mode === "chords") return s === FIST ? "Major" : i >= 0 ? QUALS[i][0] : "?";
+  return OCT[n] ? "Octave " + n : "(keep)";
+}
+
+MODES.forEach(m => { const b = document.createElement("button"); b.className = "tab"; b.textContent = m[0].toUpperCase() + m.slice(1); b.onclick = () => setMode(m); $("tabs").append(b); });
+$("keySel").innerHTML = CHROM.map((k, i) => `<option value="${i}">${k}</option>`).join("");
+$("instSel").innerHTML = Object.keys(INST).map(k => `<option>${k}</option>`).join("");
+$("keySel").onchange = e => { keyRoot = +e.target.value; setMode(mode); };
+$("scaleSel").onchange = e => { scale = e.target.value; setMode(mode); };
+$("instSel").onchange = e => { inst = e.target.value; if (filt) filt.frequency.value = INST[inst].cut; };
+$("octDn").onclick = () => shiftOctave(-1);
+$("octUp").onclick = () => shiftOctave(1);
+$("signs").innerHTML = "<tr><th>Sign</th><th>Right hand (root)</th><th>Left hand (chord type)</th></tr>" +
+  PATTERNS.map((p, i) => `<tr><td>${SIGN_NAMES[i]}</td><td>${ROOTS[i][0]}</td><td>${QUALS[i][0]}</td></tr>`).join("");
+
+addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (k === "m") setMode(MODES[(MODES.indexOf(mode) + 1) % 3]);
+  else if ("123".includes(k) && k) setMode(MODES[+k - 1]);
+  else if (k === "k" || k === "j") { keyRoot = (keyRoot + (k === "k" ? 1 : 11)) % 12; $("keySel").value = keyRoot; setMode(mode); }
+  else if (k === "t") { scale = scale === "major" ? "minor" : "major"; $("scaleSel").value = scale; setMode(mode); }
+  else if (k === "w") shiftOctave(1);
+  else if (k === "s") shiftOctave(-1);
+  else if (k === "x") swap = !swap;      // flip left/right labels if they come out reversed
+});
+document.addEventListener("visibilitychange", () => { if (document.hidden) { [...voices.keys()].forEach(noteOff); sounding = []; cand = []; } });
+
+// ---------- Main loop ----------
+const video = document.createElement("video");
+video.playsInline = true; video.muted = true;
+const cv = $("cv"), ctx = cv.getContext("2d"), W = cv.width, H = cv.height;
+let landmarker, res = null, lastT = -1, last = "";
+let sounding = [], cand = [], stable = 0;
+const STABLE = 2;
+
+function decide(r, l) {
+  const o = { want: null, a1: "", a2: "", now: "" };
+  const ri = r === null ? -1 : idx(r), li = l === null ? -1 : idx(l);
+  const n = l === null ? 0 : count(l);
+  if (mode !== "chords" && OCT[n]) noteBase = OCT[n];
+  const silent = r === null || r === FIST;
+  if (silent) { o.want = []; return o; }
+  if (mode === "notes" && ri >= 0 && ri < 7) {
+    o.want = [noteBase + ROOTS[ri][1]]; o.a1 = o.now = ROOTS[ri][0];
+  } else if (mode === "chords" && ri >= 0) {
+    const q = (l === null || l === FIST) ? QUALS[0] : li >= 0 ? QUALS[li] : null;
+    if (q) { o.want = q[1].map(i => chordBase + ROOTS[ri][1] + i); o.a1 = ROOTS[ri][0]; o.a2 = q[0]; o.now = o.a1 + " " + q[0]; }
+  } else if (mode === "key" && ri >= 0 && ri < 7) {
+    o.want = diatonic(ri, noteBase - 12); o.a1 = o.now = chordName(ri);
+  }
+  return o;
+}
+
+function label(text, x, y) {
+  ctx.font = "bold 18px 'Segoe UI',sans-serif";
+  const w = ctx.measureText(text).width;
+  x = Math.max(4, Math.min(x, W - w - 12)); y = Math.max(24, Math.min(y, H - 8));
+  ctx.fillStyle = "rgba(20,22,28,.8)"; ctx.fillRect(x - 6, y - 20, w + 12, 28);
+  ctx.fillStyle = "#fff"; ctx.fillText(text, x, y);
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  if (video.readyState < 2) return;
+  ctx.save(); ctx.scale(-1, 1); ctx.drawImage(video, -W, 0, W, H); ctx.restore();   // mirrored, like a selfie
+  if (video.currentTime !== lastT) { lastT = video.currentTime; res = landmarker.detectForVideo(cv, performance.now()); }
+
+  let right = null, left = null;
+  if (res && res.landmarks.length) {
+    const du = new DrawingUtils(ctx), hd = res.handedness || res.handednesses;
+    res.landmarks.forEach((lm, i) => {
+      let side = hd[i][0].categoryName;
+      if (swap) side = side === "Left" ? "Right" : "Left";
+      const s = fingers(lm);
+      if (side === "Right") right = s; else left = s;
+      du.drawConnectors(lm, HandLandmarker.HAND_CONNECTIONS, { color: "#fff", lineWidth: 2 });
+      du.drawLandmarks(lm, { color: "#ffb800", radius: 3 });
+      label(`${side}: ${handText(side, s)}`, lm[0].x * W - 30, lm[0].y * H + 36);
+    });
+  }
+
+  const o = decide(right, left);
+  if (o.want) {
+    if (same(o.want, cand)) stable++; else { cand = o.want; stable = 1; }
+    if (stable >= STABLE && !same(cand, sounding)) {
+      cand.forEach(n => { if (!sounding.includes(n)) noteOn(n); });
+      sounding.forEach(n => { if (!cand.includes(n)) noteOff(n); });
+      sounding = cand;
+    }
+  }
+  const key = o.a1 + "|" + o.a2 + "|" + o.now + "|" + mode + noteBase + chordBase;
+  if (key !== last) {
+    last = key; light($("bar1"), o.a1); light($("bar2"), o.a2);
+    $("now").textContent = o.now;
+    const base = mode === "chords" ? chordBase : mode === "key" ? noteBase - 12 : noteBase;
+    $("oct").textContent = "Octave " + (base / 12 - 1);
+  }
+}
+
+$("start").onclick = async () => {
+  $("start").disabled = true; $("msg").textContent = "Loading hand tracking...";
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)(); await ac.resume();
+    filt = ac.createBiquadFilter(); filt.type = "lowpass"; filt.frequency.value = INST[inst].cut;
+    const master = ac.createGain(); master.gain.value = .22; filt.connect(master).connect(ac.destination);
+    const fs = await FilesetResolver.forVisionTasks(CDN);
+    const make = d => HandLandmarker.createFromOptions(fs, { baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: "VIDEO", numHands: 2 });
+    try { landmarker = await make("GPU"); } catch { landmarker = await make("CPU"); }
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    await video.play();
+    $("app").style.display = "flex"; $("start").style.display = "none"; $("msg").textContent = "";
+    setMode("notes"); frame();
+  } catch (e) {
+    $("msg").textContent = "Could not start: " + e.message + ". Allow camera access and use https or localhost.";
+    $("start").disabled = false;
+  }
+};
+</script>
+</body>
+</html>
